@@ -45,6 +45,8 @@ class ReviewStore:
 
     def init_schema(self) -> None:
         with self._schema_lock, self.connect() as conn:
+            # 重建表的迁移会临时改名父表，迁移期间关闭外键检查。
+            conn.execute("PRAGMA foreign_keys=OFF")
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS users (
@@ -59,7 +61,7 @@ class ReviewStore:
                     title TEXT NOT NULL,
                     abstract TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'submitted'
-                        CHECK (status IN ('submitted','under_review','decided','withdrawn')),
+                        CHECK (status IN ('submitted','under_review','decided','withdrawn','in_reconsideration')),
                     created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS paper_versions (
@@ -90,6 +92,7 @@ class ReviewStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     paper_id INTEGER NOT NULL REFERENCES papers(id),
                     reviewer_id TEXT NOT NULL REFERENCES users(id),
+                    round INTEGER NOT NULL DEFAULT 1,
                     status TEXT NOT NULL DEFAULT 'invited'
                         CHECK (status IN ('invited','accepted','declined','completed')),
                     score INTEGER CHECK (score IS NULL OR score BETWEEN 1 AND 5),
@@ -107,11 +110,24 @@ class ReviewStore:
                 );
                 CREATE TABLE IF NOT EXISTS decisions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    paper_id INTEGER NOT NULL UNIQUE REFERENCES papers(id),
+                    paper_id INTEGER NOT NULL REFERENCES papers(id),
+                    round INTEGER NOT NULL DEFAULT 1,
                     decision TEXT NOT NULL CHECK (decision IN ('accept','reject','minor_revision','major_revision')),
                     note TEXT NOT NULL DEFAULT '',
                     decided_by TEXT NOT NULL REFERENCES users(id),
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    UNIQUE (paper_id, round)
+                );
+                CREATE TABLE IF NOT EXISTS reconsideration_requests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    paper_id INTEGER NOT NULL UNIQUE REFERENCES papers(id),
+                    author_id TEXT NOT NULL REFERENCES users(id),
+                    reason TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending','accepted','rejected')),
+                    resolved_by TEXT REFERENCES users(id),
+                    created_at TEXT NOT NULL,
+                    resolved_at TEXT
                 );
                 CREATE TABLE IF NOT EXISTS audit_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -124,6 +140,79 @@ class ReviewStore:
                 );
                 """
             )
+            self._migrate(conn)
+            conn.execute("PRAGMA foreign_keys=ON")
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """把旧版数据库升级到支持复核轮次的结构（每篇论文可有多轮决定）。"""
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(assignments)")}
+        if "round" not in cols:
+            conn.execute("ALTER TABLE assignments ADD COLUMN round INTEGER NOT NULL DEFAULT 1")
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(decisions)")}
+        if "round" not in cols:
+            conn.execute("ALTER TABLE decisions ADD COLUMN round INTEGER NOT NULL DEFAULT 1")
+        # 旧约束是 UNIQUE(paper_id)，需替换为 UNIQUE(paper_id, round) 以容纳复核后的新决定。
+        unique_indexes = conn.execute("PRAGMA index_list(decisions)").fetchall()
+        has_round_unique = any(
+            idx["origin"] == "u"
+            and [r["name"] for r in conn.execute(f"PRAGMA index_info({idx['name']})")] == ["paper_id", "round"]
+            for idx in unique_indexes
+        )
+        if not has_round_unique:
+            legacy_paper_unique = any(
+                idx["origin"] == "u"
+                and [r["name"] for r in conn.execute(f"PRAGMA index_info({idx['name']})")] == ["paper_id"]
+                for idx in unique_indexes
+            )
+            if legacy_paper_unique:
+                # 旧表由 CREATE TABLE 的 UNIQUE 列约束生成自动索引，需重建表以解除约束。
+                conn.execute("PRAGMA legacy_alter_table=ON")
+                conn.execute("ALTER TABLE decisions RENAME TO decisions_old")
+                conn.execute(
+                    """CREATE TABLE decisions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        paper_id INTEGER NOT NULL REFERENCES papers(id),
+                        round INTEGER NOT NULL DEFAULT 1,
+                        decision TEXT NOT NULL CHECK (decision IN ('accept','reject','minor_revision','major_revision')),
+                        note TEXT NOT NULL DEFAULT '',
+                        decided_by TEXT NOT NULL REFERENCES users(id),
+                        created_at TEXT NOT NULL,
+                        UNIQUE (paper_id, round)
+                    )"""
+                )
+                conn.execute(
+                    "INSERT INTO decisions(id,paper_id,round,decision,note,decided_by,created_at) "
+                    "SELECT id,paper_id,round,decision,note,decided_by,created_at FROM decisions_old"
+                )
+                conn.execute("DROP TABLE decisions_old")
+                conn.execute("PRAGMA legacy_alter_table=OFF")
+            else:
+                conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_decisions_paper_round ON decisions(paper_id, round)")
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(papers)")}
+        status_check = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='papers'"
+        ).fetchone()[0]
+        if "in_reconsideration" not in status_check and "status" in cols:
+            # CHECK 约束无法直接修改，重建 papers 表以扩展状态集合。
+            conn.execute("PRAGMA legacy_alter_table=ON")
+            conn.execute("ALTER TABLE papers RENAME TO papers_old")
+            conn.execute(
+                """CREATE TABLE papers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    author_id TEXT NOT NULL REFERENCES users(id),
+                    title TEXT NOT NULL,
+                    abstract TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'submitted'
+                        CHECK (status IN ('submitted','under_review','decided','withdrawn','in_reconsideration')),
+                    created_at TEXT NOT NULL
+                )"""
+            )
+            conn.execute(
+                "INSERT INTO papers(id,author_id,title,abstract,status,created_at) "
+                "SELECT id,author_id,title,abstract,status,created_at FROM papers_old"
+            )
+            conn.execute("DROP TABLE papers_old")
+            conn.execute("PRAGMA legacy_alter_table=OFF")
 
     def seed(self) -> None:
         self.init_schema()
@@ -133,6 +222,7 @@ class ReviewStore:
             ("r1", "评审人一号", "reviewer", 3),
             ("r2", "评审人二号", "reviewer", 3),
             ("r3", "评审人三号", "reviewer", 2),
+            ("r4", "评审人四号", "reviewer", 3),
             ("chair", "程序委员会主席", "chair", 0),
         ]
         with self.connect() as conn:
@@ -180,15 +270,21 @@ class ReviewStore:
             return {"id": paper_id, "status": "submitted", "version": 1, "sha256": digest}
 
     def _paper_view(self, conn: sqlite3.Connection, paper: sqlite3.Row, viewer: sqlite3.Row) -> dict:
+        review_round = 2 if paper["status"] == "in_reconsideration" else 1
         data = {
             "id": paper["id"],
             "title": paper["title"],
             "abstract": paper["abstract"],
             "status": paper["status"],
+            "review_round": review_round,
             "created_at": paper["created_at"],
         }
         if viewer["role"] == "chair" or viewer["id"] == paper["author_id"]:
             data["author_id"] = paper["author_id"]
+            req = conn.execute(
+                "SELECT * FROM reconsideration_requests WHERE paper_id=?", (paper["id"],)
+            ).fetchone()
+            data["reconsideration"] = dict(req) if req else None
         else:
             data["author_id"] = None  # 双盲：评审人看不到作者身份。
         return data
@@ -254,7 +350,7 @@ class ReviewStore:
             reviewer = self._user(conn, reviewer_id)
             self._require(reviewer, "reviewer")
             paper = conn.execute("SELECT status FROM papers WHERE id=?", (paper_id,)).fetchone()
-            if not paper or paper["status"] not in {"submitted", "under_review"}:
+            if not paper or paper["status"] not in {"submitted", "under_review", "in_reconsideration"}:
                 raise BusinessError("论文不存在或当前不可表达意向", 409, "paper_unavailable")
             if conn.execute("SELECT 1 FROM conflicts WHERE reviewer_id=? AND paper_id=?", (reviewer_id, paper_id)).fetchone():
                 raise BusinessError("存在利益冲突，不能表达评审意向", 409, "conflict_of_interest")
@@ -273,8 +369,9 @@ class ReviewStore:
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 paper = conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone()
-                if not paper or paper["status"] not in {"submitted", "under_review"}:
+                if not paper or paper["status"] not in {"submitted", "under_review", "in_reconsideration"}:
                     raise BusinessError("论文不存在或不可分配", 409, "paper_unavailable")
+                review_round = 2 if paper["status"] == "in_reconsideration" else 1
                 reviewer = self._user(conn, reviewer_id)
                 self._require(reviewer, "reviewer")
                 if conn.execute("SELECT 1 FROM conflicts WHERE reviewer_id=? AND paper_id=?", (reviewer_id, paper_id)).fetchone():
@@ -287,15 +384,16 @@ class ReviewStore:
                     raise BusinessError("评审人已达到负载上限", 409, "reviewer_at_capacity")
                 try:
                     cur = conn.execute(
-                        "INSERT INTO assignments(paper_id,reviewer_id,created_at,updated_at) VALUES(?,?,?,?)",
-                        (paper_id, reviewer_id, utcnow(), utcnow()),
+                        "INSERT INTO assignments(paper_id,reviewer_id,round,created_at,updated_at) VALUES(?,?,?,?,?)",
+                        (paper_id, reviewer_id, review_round, utcnow(), utcnow()),
                     )
                 except sqlite3.IntegrityError:
                     raise BusinessError("该评审人已被分配此论文", 409, "assignment_exists")
-                conn.execute("UPDATE papers SET status='under_review' WHERE id=?", (paper_id,))
+                if paper["status"] == "submitted":
+                    conn.execute("UPDATE papers SET status='under_review' WHERE id=?", (paper_id,))
                 assignment_id = cur.lastrowid
-                self._audit(conn, paper_id, chair_id, "assignment.invite", {"assignment_id": assignment_id, "reviewer_id": reviewer_id})
-                return {"id": assignment_id, "paper_id": paper_id, "reviewer_id": reviewer_id, "status": "invited"}
+                self._audit(conn, paper_id, chair_id, "assignment.invite", {"assignment_id": assignment_id, "reviewer_id": reviewer_id, "round": review_round})
+                return {"id": assignment_id, "paper_id": paper_id, "reviewer_id": reviewer_id, "round": review_round, "status": "invited"}
             except Exception:
                 conn.rollback()
                 raise
@@ -365,18 +463,96 @@ class ReviewStore:
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 paper = conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone()
-                if not paper or paper["status"] not in {"submitted", "under_review"}:
-                    raise BusinessError("论文不存在或已经决定", 409, "paper_decided")
-                completed = conn.execute("SELECT COUNT(*) FROM assignments WHERE paper_id=? AND status='completed'", (paper_id,)).fetchone()[0]
+                if not paper:
+                    raise BusinessError("论文不存在", 404, "not_found")
+                if paper["status"] == "in_reconsideration":
+                    review_round = 2
+                elif paper["status"] in {"submitted", "under_review"}:
+                    review_round = 1
+                else:
+                    raise BusinessError("论文已经决定", 409, "paper_decided")
+                completed = conn.execute(
+                    "SELECT COUNT(*) FROM assignments WHERE paper_id=? AND status='completed' AND round=?",
+                    (paper_id, review_round),
+                ).fetchone()[0]
                 if completed < 2:
-                    raise BusinessError("至少需要两份已完成评审才能作出决定", 409, "insufficient_reviews")
+                    raise BusinessError("至少需要两份本轮已完成评审才能作出决定", 409, "insufficient_reviews")
                 cur = conn.execute(
-                    "INSERT INTO decisions(paper_id,decision,note,decided_by,created_at) VALUES(?,?,?,?,?)",
-                    (paper_id, decision, note.strip(), chair_id, utcnow()),
+                    "INSERT INTO decisions(paper_id,round,decision,note,decided_by,created_at) VALUES(?,?,?,?,?,?)",
+                    (paper_id, review_round, decision, note.strip(), chair_id, utcnow()),
                 )
                 conn.execute("UPDATE papers SET status='decided' WHERE id=?", (paper_id,))
-                self._audit(conn, paper_id, chair_id, "decision.record", {"decision": decision, "note": note.strip()})
-                return {"id": cur.lastrowid, "paper_id": paper_id, "decision": decision, "note": note.strip()}
+                self._audit(conn, paper_id, chair_id, "decision.record", {"decision": decision, "note": note.strip(), "round": review_round})
+                return {"id": cur.lastrowid, "paper_id": paper_id, "round": review_round, "decision": decision, "note": note.strip()}
+            except Exception:
+                conn.rollback()
+                raise
+
+    def request_reconsideration(self, author_id: str, paper_id: int, reason: str) -> dict:
+        if len(reason.strip()) < 10:
+            raise BusinessError("复核说明至少 10 字", 422, "reconsideration_reason_too_short")
+        with self.connect() as conn:
+            author = self._user(conn, author_id)
+            self._require(author, "author")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                paper = conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone()
+                if not paper or paper["author_id"] != author_id:
+                    raise BusinessError("论文不存在或不属于当前作者", 404, "not_found")
+                existing = conn.execute(
+                    "SELECT * FROM reconsideration_requests WHERE paper_id=?", (paper_id,)
+                ).fetchone()
+                if existing:
+                    if existing["status"] == "pending":
+                        raise BusinessError("复核申请已提交，等待主席受理", 409, "reconsideration_pending")
+                    if existing["status"] == "rejected":
+                        raise BusinessError("复核申请未被接受，不能再次开启复核", 409, "reconsideration_rejected")
+                    raise BusinessError("该论文已经开启过复核，不能重复开启", 409, "reconsideration_already_opened")
+                if paper["status"] != "decided":
+                    raise BusinessError("仅在决定发布后才能申请复核", 409, "paper_not_decided")
+                cur = conn.execute(
+                    "INSERT INTO reconsideration_requests(paper_id,author_id,reason,created_at) VALUES(?,?,?,?)",
+                    (paper_id, author_id, reason.strip(), utcnow()),
+                )
+                self._audit(conn, paper_id, author_id, "reconsideration.request", {"request_id": cur.lastrowid, "reason": reason.strip()})
+                return {"id": cur.lastrowid, "paper_id": paper_id, "status": "pending", "reason": reason.strip()}
+            except Exception:
+                conn.rollback()
+                raise
+
+    def respond_reconsideration(self, chair_id: str, paper_id: int, accepted: bool) -> dict:
+        with self.connect() as conn:
+            chair = self._user(conn, chair_id)
+            self._require(chair, "chair")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                paper = conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone()
+                if not paper:
+                    raise BusinessError("论文不存在", 404, "not_found")
+                req = conn.execute(
+                    "SELECT * FROM reconsideration_requests WHERE paper_id=?", (paper_id,)
+                ).fetchone()
+                if not req or req["status"] != "pending":
+                    raise BusinessError("没有待受理的复核申请", 404, "reconsideration_not_pending")
+                new_status = "accepted" if accepted else "rejected"
+                conn.execute(
+                    "UPDATE reconsideration_requests SET status=?,resolved_by=?,resolved_at=? WHERE id=?",
+                    (new_status, chair_id, utcnow(), req["id"]),
+                )
+                if accepted:
+                    if paper["status"] != "decided":
+                        raise BusinessError("仅已决定的论文可以接受复核", 409, "paper_not_decided")
+                    prior = conn.execute(
+                        "SELECT id FROM decisions WHERE paper_id=? AND round=1 ORDER BY id", (paper_id,)
+                    ).fetchall()
+                    conn.execute("UPDATE papers SET status='in_reconsideration' WHERE id=?", (paper_id,))
+                    self._audit(
+                        conn, paper_id, chair_id, "reconsideration.accept",
+                        {"request_id": req["id"], "superseded_decisions": [r["id"] for r in prior]},
+                    )
+                else:
+                    self._audit(conn, paper_id, chair_id, "reconsideration.reject", {"request_id": req["id"]})
+                return {"id": req["id"], "paper_id": paper_id, "status": new_status}
             except Exception:
                 conn.rollback()
                 raise
@@ -455,6 +631,11 @@ class ReviewHandler(BaseHTTPRequestHandler):
             if len(parts) == 4 and parts[3] == "decision" and method == "POST":
                 data = self._body()
                 return self._send(201, store.decide(self._user_id(), paper_id, data.get("decision", ""), data.get("note", "")))
+            if len(parts) == 4 and parts[3] == "reconsideration" and method == "POST":
+                data = self._body()
+                if data.get("action") == "respond":
+                    return self._send(200, store.respond_reconsideration(self._user_id(), paper_id, bool(data.get("accepted"))))
+                return self._send(201, store.request_reconsideration(self._user_id(), paper_id, data.get("reason", "")))
             if len(parts) == 4 and parts[3] == "history" and method == "GET":
                 return self._send(200, {"items": store.history(self._user_id(), paper_id)})
         if len(parts) == 4 and parts[:2] == ["api", "assignments"] and method == "POST":

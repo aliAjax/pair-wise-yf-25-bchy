@@ -17,7 +17,7 @@ python -m unittest -v
 
 ## 角色和主要接口
 
-演示用户：`alice`、`bob`（作者），`r1`、`r2`、`r3`（评审人），`chair`（主席）。所有 API 请求应带 `X-User-Id` 请求头。
+演示用户：`alice`、`bob`（作者），`r1`、`r2`、`r3`、`r4`（评审人），`chair`（主席）。所有 API 请求应带 `X-User-Id` 请求头。
 
 - `POST /api/papers`：提交论文。
 - `GET /api/papers` / `GET /api/papers/{id}`：按角色隔离查看；评审人看到双盲视图。
@@ -27,9 +27,17 @@ python -m unittest -v
 - `POST /api/assignments/{id}/respond`：接受或拒绝邀请。
 - `POST /api/assignments/{id}/review`：提交 1-5 分评审。
 - `POST /api/papers/{id}/rebuttal`：作者提交一次 Rebuttal。
-- `POST /api/papers/{id}/decision`：收到至少两份评审后作决定。
+- `POST /api/papers/{id}/decision`：收到至少两份本轮评审后作决定。
+- `POST /api/papers/{id}/reconsideration`：决定发布后，作者附说明申请一次复核（`{"reason": ...}`）；主席用 `{"action":"respond","accepted":true|false}` 受理或驳回。
 - `GET /api/papers/{id}/history`：审计历史。
 
 ## 业务不变量
 
-评审人不能查看未分配论文的作者身份；利益冲突禁止投标和分配；邀请和完成状态不能跳步；每位评审人的未完成分配受 `load_limit` 限制；每篇论文只能提交一次 Rebuttal；决定必须至少基于两份已完成评审。
+评审人不能查看未分配论文的作者身份；利益冲突禁止投标和分配；邀请和完成状态不能跳步；每位评审人的未完成分配受 `load_limit` 限制；每篇论文只能提交一次 Rebuttal；决定必须至少基于两份本轮已完成评审。
+
+### 复核（Reconsideration）
+
+- 只有 `decided` 状态论文的作者可申请，且每篇论文全生命周期最多一次复核申请。
+- 主席接受后论文进入 `in_reconsideration`；原决定、原评审和原分配完整保留在历史中，第一轮评审不再计入新决定的评审数。
+- 主席须在复核轮另行安排至少两名无利益冲突的评审人（第一轮评审人不可重复分配），两人完成评审后才能作出第二轮决定。
+- 待受理期间不能重复提交；申请被驳回、或复核已产生新决定后，不能再次开启复核。
