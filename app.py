@@ -59,7 +59,8 @@ class ReviewStore:
                     title TEXT NOT NULL,
                     abstract TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'submitted'
-                        CHECK (status IN ('submitted','under_review','decided','withdrawn')),
+                        CHECK (status IN ('submitted','under_review','re_review','decided','withdrawn')),
+                    review_round INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS paper_versions (
@@ -90,13 +91,14 @@ class ReviewStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     paper_id INTEGER NOT NULL REFERENCES papers(id),
                     reviewer_id TEXT NOT NULL REFERENCES users(id),
+                    round INTEGER NOT NULL DEFAULT 1,
                     status TEXT NOT NULL DEFAULT 'invited'
                         CHECK (status IN ('invited','accepted','declined','completed')),
                     score INTEGER CHECK (score IS NULL OR score BETWEEN 1 AND 5),
                     review_text TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    UNIQUE (paper_id, reviewer_id)
+                    UNIQUE (paper_id, reviewer_id, round)
                 );
                 CREATE TABLE IF NOT EXISTS rebuttals (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -107,11 +109,23 @@ class ReviewStore:
                 );
                 CREATE TABLE IF NOT EXISTS decisions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    paper_id INTEGER NOT NULL UNIQUE REFERENCES papers(id),
+                    paper_id INTEGER NOT NULL REFERENCES papers(id),
+                    round INTEGER NOT NULL DEFAULT 1,
                     decision TEXT NOT NULL CHECK (decision IN ('accept','reject','minor_revision','major_revision')),
                     note TEXT NOT NULL DEFAULT '',
                     decided_by TEXT NOT NULL REFERENCES users(id),
                     created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS rereview_requests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    paper_id INTEGER NOT NULL UNIQUE REFERENCES papers(id),
+                    author_id TEXT NOT NULL REFERENCES users(id),
+                    reason TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending','accepted','rejected')),
+                    responded_by TEXT REFERENCES users(id),
+                    created_at TEXT NOT NULL,
+                    responded_at TEXT
                 );
                 CREATE TABLE IF NOT EXISTS audit_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -133,6 +147,7 @@ class ReviewStore:
             ("r1", "评审人一号", "reviewer", 3),
             ("r2", "评审人二号", "reviewer", 3),
             ("r3", "评审人三号", "reviewer", 2),
+            ("r4", "评审人四号", "reviewer", 3),
             ("chair", "程序委员会主席", "chair", 0),
         ]
         with self.connect() as conn:
@@ -254,7 +269,7 @@ class ReviewStore:
             reviewer = self._user(conn, reviewer_id)
             self._require(reviewer, "reviewer")
             paper = conn.execute("SELECT status FROM papers WHERE id=?", (paper_id,)).fetchone()
-            if not paper or paper["status"] not in {"submitted", "under_review"}:
+            if not paper or paper["status"] not in {"submitted", "under_review", "re_review"}:
                 raise BusinessError("论文不存在或当前不可表达意向", 409, "paper_unavailable")
             if conn.execute("SELECT 1 FROM conflicts WHERE reviewer_id=? AND paper_id=?", (reviewer_id, paper_id)).fetchone():
                 raise BusinessError("存在利益冲突，不能表达评审意向", 409, "conflict_of_interest")
@@ -273,7 +288,7 @@ class ReviewStore:
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 paper = conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone()
-                if not paper or paper["status"] not in {"submitted", "under_review"}:
+                if not paper or paper["status"] not in {"submitted", "under_review", "re_review"}:
                     raise BusinessError("论文不存在或不可分配", 409, "paper_unavailable")
                 reviewer = self._user(conn, reviewer_id)
                 self._require(reviewer, "reviewer")
@@ -287,14 +302,14 @@ class ReviewStore:
                     raise BusinessError("评审人已达到负载上限", 409, "reviewer_at_capacity")
                 try:
                     cur = conn.execute(
-                        "INSERT INTO assignments(paper_id,reviewer_id,created_at,updated_at) VALUES(?,?,?,?)",
-                        (paper_id, reviewer_id, utcnow(), utcnow()),
+                        "INSERT INTO assignments(paper_id,reviewer_id,round,created_at,updated_at) VALUES(?,?,?,?,?)",
+                        (paper_id, reviewer_id, paper["review_round"], utcnow(), utcnow()),
                     )
                 except sqlite3.IntegrityError:
-                    raise BusinessError("该评审人已被分配此论文", 409, "assignment_exists")
-                conn.execute("UPDATE papers SET status='under_review' WHERE id=?", (paper_id,))
+                    raise BusinessError("该评审人本轮已被分配此论文", 409, "assignment_exists")
+                conn.execute("UPDATE papers SET status='under_review' WHERE id=? AND status='submitted'", (paper_id,))
                 assignment_id = cur.lastrowid
-                self._audit(conn, paper_id, chair_id, "assignment.invite", {"assignment_id": assignment_id, "reviewer_id": reviewer_id})
+                self._audit(conn, paper_id, chair_id, "assignment.invite", {"assignment_id": assignment_id, "reviewer_id": reviewer_id, "round": paper["review_round"]})
                 return {"id": assignment_id, "paper_id": paper_id, "reviewer_id": reviewer_id, "status": "invited"}
             except Exception:
                 conn.rollback()
@@ -365,18 +380,74 @@ class ReviewStore:
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 paper = conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone()
-                if not paper or paper["status"] not in {"submitted", "under_review"}:
+                if not paper or paper["status"] not in {"submitted", "under_review", "re_review"}:
                     raise BusinessError("论文不存在或已经决定", 409, "paper_decided")
-                completed = conn.execute("SELECT COUNT(*) FROM assignments WHERE paper_id=? AND status='completed'", (paper_id,)).fetchone()[0]
+                # 只统计当前轮次：复核开启后，原有评审不能再支撑新决定。
+                completed = conn.execute(
+                    "SELECT COUNT(*) FROM assignments WHERE paper_id=? AND status='completed' AND round=?",
+                    (paper_id, paper["review_round"]),
+                ).fetchone()[0]
                 if completed < 2:
-                    raise BusinessError("至少需要两份已完成评审才能作出决定", 409, "insufficient_reviews")
+                    raise BusinessError("至少需要两份本轮已完成评审才能作出决定", 409, "insufficient_reviews")
                 cur = conn.execute(
-                    "INSERT INTO decisions(paper_id,decision,note,decided_by,created_at) VALUES(?,?,?,?,?)",
-                    (paper_id, decision, note.strip(), chair_id, utcnow()),
+                    "INSERT INTO decisions(paper_id,round,decision,note,decided_by,created_at) VALUES(?,?,?,?,?,?)",
+                    (paper_id, paper["review_round"], decision, note.strip(), chair_id, utcnow()),
                 )
                 conn.execute("UPDATE papers SET status='decided' WHERE id=?", (paper_id,))
-                self._audit(conn, paper_id, chair_id, "decision.record", {"decision": decision, "note": note.strip()})
+                self._audit(conn, paper_id, chair_id, "decision.record", {"decision": decision, "note": note.strip(), "round": paper["review_round"]})
                 return {"id": cur.lastrowid, "paper_id": paper_id, "decision": decision, "note": note.strip()}
+            except Exception:
+                conn.rollback()
+                raise
+
+    def request_rereview(self, author_id: str, paper_id: int, reason: str) -> dict:
+        if len(reason.strip()) < 10:
+            raise BusinessError("复核申请说明至少 10 字", 422, "reason_too_short")
+        with self.connect() as conn:
+            author = self._user(conn, author_id)
+            self._require(author, "author")
+            paper = conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone()
+            if not paper or paper["author_id"] != author_id:
+                raise BusinessError("论文不存在或不属于当前作者", 404, "not_found")
+            if paper["status"] != "decided":
+                raise BusinessError("只有已公布决定的论文才能申请复核", 409, "paper_not_decided")
+            try:
+                cur = conn.execute(
+                    "INSERT INTO rereview_requests(paper_id,author_id,reason,created_at) VALUES(?,?,?,?)",
+                    (paper_id, author_id, reason.strip(), utcnow()),
+                )
+            except sqlite3.IntegrityError:
+                raise BusinessError("每篇论文只能提交一次复核申请", 409, "rereview_exists")
+            self._audit(conn, paper_id, author_id, "rereview.request", {"request_id": cur.lastrowid, "reason": reason.strip()})
+            return {"id": cur.lastrowid, "paper_id": paper_id, "status": "pending"}
+
+    def respond_rereview(self, chair_id: str, paper_id: int, accept: bool) -> dict:
+        with self.connect() as conn:
+            chair = self._user(conn, chair_id)
+            self._require(chair, "chair")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                req = conn.execute("SELECT * FROM rereview_requests WHERE paper_id=?", (paper_id,)).fetchone()
+                if not req:
+                    raise BusinessError("复核申请不存在", 404, "not_found")
+                if req["status"] != "pending":
+                    raise BusinessError("复核申请已处理，不能重复开启复核", 409, "rereview_already_answered")
+                paper = conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone()
+                new_round = paper["review_round"]
+                status = "rejected"
+                if accept:
+                    if paper["status"] != "decided":
+                        raise BusinessError("论文已有新决定，不能重复开启复核", 409, "paper_not_decided")
+                    # 原决定、原评审、原分配全部保留；论文进入复核中并开启新一轮。
+                    new_round += 1
+                    status = "accepted"
+                    conn.execute("UPDATE papers SET status='re_review',review_round=? WHERE id=?", (new_round, paper_id))
+                conn.execute(
+                    "UPDATE rereview_requests SET status=?,responded_by=?,responded_at=? WHERE id=?",
+                    (status, chair_id, utcnow(), req["id"]),
+                )
+                self._audit(conn, paper_id, chair_id, "rereview.respond", {"request_id": req["id"], "status": status, "round": new_round})
+                return {"id": req["id"], "paper_id": paper_id, "status": status, "round": new_round}
             except Exception:
                 conn.rollback()
                 raise
@@ -455,6 +526,12 @@ class ReviewHandler(BaseHTTPRequestHandler):
             if len(parts) == 4 and parts[3] == "decision" and method == "POST":
                 data = self._body()
                 return self._send(201, store.decide(self._user_id(), paper_id, data.get("decision", ""), data.get("note", "")))
+            if len(parts) == 4 and parts[3] == "rereview" and method == "POST":
+                data = self._body()
+                return self._send(201, store.request_rereview(self._user_id(), paper_id, data.get("reason", "")))
+            if len(parts) == 5 and parts[3] == "rereview" and parts[4] == "respond" and method == "POST":
+                data = self._body()
+                return self._send(200, store.respond_rereview(self._user_id(), paper_id, bool(data.get("accept"))))
             if len(parts) == 4 and parts[3] == "history" and method == "GET":
                 return self._send(200, {"items": store.history(self._user_id(), paper_id)})
         if len(parts) == 4 and parts[:2] == ["api", "assignments"] and method == "POST":
